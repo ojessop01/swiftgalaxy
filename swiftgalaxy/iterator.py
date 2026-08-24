@@ -8,6 +8,9 @@ interest within a single simulation snapshot.
 Parallelization is not yet implemented but is prioritized for future release.
 """
 
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import unyt as u
 from swiftsimio import mask, cosmo_array
@@ -15,8 +18,309 @@ from .reader import SWIFTGalaxy
 from .halo_catalogues import _HaloCatalogue
 from warnings import warn
 
-from typing import Optional, Set, Any, List, Callable, Dict, Tuple, Generator, TypedDict
-from swiftsimio.masks import SWIFTMask
+from typing import (
+    Optional,
+    Set,
+    Any,
+    List,
+    Callable,
+    Dict,
+    Tuple,
+    Generator,
+    NamedTuple,
+    TypedDict,
+)
+from scipy.spatial.transform import RigidTransform
+
+
+class _CoordinateFrameSpec(NamedTuple):
+    """
+    A picklable description of a coordinate frame to be copied onto other galaxies.
+
+    A :class:`~swiftgalaxy.reader.SWIFTGalaxy` cannot be sent to a worker process
+    because it holds :mod:`h5py` file handles. Only four small values of the
+    ``coordinate_frame_from`` galaxy are ever used, however: its length and time units
+    (to check compatibility) and its two rigid transforms. Those all pickle, so this
+    carries them instead of the galaxy.
+
+    The units are stored in their string form. A :mod:`unyt` quantity carries a unit
+    registry that pickles to tens of kilobytes, which would be paid once per region,
+    while the string comparison reproduces the same result at a couple of dozen bytes.
+
+    Attributes
+    ----------
+    length_unit : :obj:`str`
+        Internal length unit of the source galaxy.
+
+    time_unit : :obj:`str`
+        Internal time unit of the source galaxy.
+
+    coordinate_transform : :class:`~scipy.spatial.transform.RigidTransform`
+        The coordinate-like transform of the source galaxy.
+
+    velocity_transform : :class:`~scipy.spatial.transform.RigidTransform`
+        The velocity-like transform of the source galaxy.
+    """
+
+    length_unit: str
+    time_unit: str
+    coordinate_transform: RigidTransform
+    velocity_transform: RigidTransform
+
+    @classmethod
+    def from_swift_galaxy(cls, sg: "SWIFTGalaxy") -> "_CoordinateFrameSpec":
+        """
+        Extract the picklable parts of a galaxy's coordinate frame.
+
+        Parameters
+        ----------
+        sg : :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+            The galaxy whose coordinate frame is to be copied.
+
+        Returns
+        -------
+        :class:`~swiftgalaxy.iterator._CoordinateFrameSpec`
+            The extracted coordinate frame.
+        """
+        return cls(
+            length_unit=str(sg.metadata.units.length),
+            time_unit=str(sg.metadata.units.time),
+            coordinate_transform=sg._coordinate_like_transform,
+            velocity_transform=sg._velocity_like_transform,
+        )
+
+    def apply_to(self, swift_galaxy: "SWIFTGalaxy") -> None:
+        """
+        Place a galaxy in this coordinate frame.
+
+        Parameters
+        ----------
+        swift_galaxy : :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+            The galaxy to transform, in place.
+
+        Raises
+        ------
+        ValueError
+            If the internal units of the two galaxies do not match.
+        """
+        if (self.length_unit != str(swift_galaxy.metadata.units.length)) or (
+            self.time_unit != str(swift_galaxy.metadata.units.time)
+        ):
+            raise ValueError(
+                "Internal units (length and time) of coordinate_frame_from don't match."
+            )
+        swift_galaxy._transform(self.coordinate_transform, boost=False)
+        swift_galaxy._transform(self.velocity_transform, boost=True)
+        return
+
+
+class _RegionTask(NamedTuple):
+    """
+    A self-contained, picklable unit of work: one region and its targets.
+
+    Everything a worker process needs to do its share of the iteration, expressed as
+    plain data. No live object (which would hold unpicklable :mod:`h5py` handles)
+    appears here.
+
+    Attributes
+    ----------
+    snapshot_filename : :obj:`str`
+        Name of file containing snapshot.
+
+    catalogue_spec : :obj:`tuple`
+        A ``(class, kwargs)`` pair rebuilding the halo catalogue for this region's
+        targets, from
+        :meth:`~swiftgalaxy.halo_catalogues._HaloCatalogue._subset_spec`.
+
+    region : :class:`~swiftsimio.objects.cosmo_array`
+        Bounding box of the region to read.
+
+    target_indices : :obj:`list`
+        Positions of this region's targets in the user's original target list, used to
+        key the results.
+
+    sg_kwargs : :obj:`dict`
+        Configuration forwarded to each
+        :class:`~swiftgalaxy.reader.SWIFTGalaxy`.
+
+    auto_recentre : :obj:`bool`
+        Whether to recentre on the halo catalogue's centres.
+
+    coordinate_frame_spec : :class:`~swiftgalaxy.iterator._CoordinateFrameSpec` \
+    (optional)
+        Coordinate frame to copy, if any.
+
+    func : callable (optional)
+        Function to apply to each galaxy. If ``None`` the galaxies themselves are
+        yielded (serial use only).
+
+    args : :obj:`list` (optional)
+        Positional arguments for ``func``, one :obj:`tuple` per target.
+
+    kwargs : :obj:`list` (optional)
+        Keyword arguments for ``func``, one :obj:`dict` per target.
+    """
+
+    snapshot_filename: str
+    catalogue_spec: Tuple
+    region: cosmo_array
+    target_indices: List[int]
+    sg_kwargs: Dict[str, Any]
+    auto_recentre: bool
+    coordinate_frame_spec: Optional[_CoordinateFrameSpec] = None
+    func: Optional[Callable] = None
+    args: Optional[List[Tuple]] = None
+    kwargs: Optional[List[Dict]] = None
+
+
+def _worker_context() -> multiprocessing.context.BaseContext:
+    """
+    Choose a process start method that is safe to use with HDF5.
+
+    The default on Linux is ``fork``, which copies the parent's memory including any
+    open HDF5 file handles. HDF5 is not fork-safe, and python warns that forking a
+    multi-threaded process risks deadlocking the child. ``forkserver`` starts workers
+    from a clean single-threaded process instead, and ``spawn`` is used where
+    ``forkserver`` is unavailable (such as on Windows).
+
+    Returns
+    -------
+    :class:`multiprocessing.context.BaseContext`
+        A context using the preferred start method.
+    """
+    available = multiprocessing.get_all_start_methods()
+    for method in ("forkserver", "spawn"):
+        if method in available:
+            return multiprocessing.get_context(method)
+    return multiprocessing.get_context()
+
+
+def _make_server(
+    snapshot_filename: str, region: cosmo_array, sg_kwargs: Dict[str, Any]
+) -> "SWIFTGalaxy":
+    """
+    Create a "server" :class:`~swiftgalaxy.reader.SWIFTGalaxy` for a region.
+
+    The "server" loads all of the particles in a given region and can be repeatedly
+    masked (creating copies of subsets of the particles) to efficiently provide
+    :class:`~swiftgalaxy.reader.SWIFTGalaxy`'s for all objects of interest in a common
+    region.
+
+    Parameters
+    ----------
+    snapshot_filename : :obj:`str`
+        Name of file containing snapshot.
+
+    region : :class:`~swiftsimio.objects.cosmo_array`
+        Bounding box of the region to read.
+
+    sg_kwargs : :obj:`dict`
+        Dataset naming and transformation configuration to forward.
+
+    Returns
+    -------
+    :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+        The server for this region.
+    """
+    region_mask = mask(snapshot_filename)
+    region_mask.constrain_spatial(region)
+    return SWIFTGalaxy._copyinit(
+        snapshot_filename=snapshot_filename,
+        halo_catalogue=None,
+        auto_recentre=False,
+        _spatial_mask=region_mask,
+        _extra_mask=None,
+        **sg_kwargs,
+    )
+
+
+def _iterate_region(
+    task: _RegionTask, halo_catalogue: Optional[_HaloCatalogue] = None
+) -> Generator:
+    """
+    Read one region and yield its galaxies, one at a time.
+
+    This is the single implementation shared by serial iteration and by parallel
+    workers, so that the two cannot drift apart. Reading the region once and masking
+    copies out of it is what makes grouping targets by region worthwhile.
+
+    Parameters
+    ----------
+    task : :class:`~swiftgalaxy.iterator._RegionTask`
+        The region and targets to iterate.
+
+    halo_catalogue : :class:`~swiftgalaxy.halo_catalogues._HaloCatalogue` (optional), \
+    default: ``None``
+        An existing catalogue to use. If ``None`` (the case in a worker process) one is
+        rebuilt from ``task.catalogue_spec``.
+
+    Yields
+    ------
+    :obj:`tuple`
+        Pairs of the target's position in the user's original list and the
+        corresponding :class:`~swiftgalaxy.reader.SWIFTGalaxy`.
+
+    Raises
+    ------
+    ValueError
+        If both ``auto_recentre`` and a coordinate frame to copy are requested.
+    """
+    if halo_catalogue is None:
+        catalogue_class, catalogue_kwargs = task.catalogue_spec
+        halo_catalogue = catalogue_class(**catalogue_kwargs)
+        # a rebuilt catalogue holds only this region's targets, in order
+        local_indices = list(range(len(task.target_indices)))
+    else:
+        local_indices = list(task.target_indices)
+    server = _make_server(task.snapshot_filename, task.region, task.sg_kwargs)
+    for local_index, target_index in zip(local_indices, task.target_indices):
+        halo_catalogue._mask_multi_galaxy(local_index)
+        server_mask = halo_catalogue._get_extra_mask(server, mask_loaded=False)
+        swift_galaxy = server._data_copy(server_mask, _data_server=server)
+        swift_galaxy.halo_catalogue = halo_catalogue
+        if task.auto_recentre and task.coordinate_frame_spec is not None:
+            raise ValueError(
+                "Cannot use coordinate_frame_from with auto_recentre=True."
+            )
+        elif task.coordinate_frame_spec is not None:
+            task.coordinate_frame_spec.apply_to(swift_galaxy)
+        elif task.auto_recentre:
+            swift_galaxy.recentre(halo_catalogue.centre)
+            swift_galaxy.recentre_velocity(halo_catalogue.velocity_centre)
+        yield target_index, swift_galaxy
+        halo_catalogue._unmask_multi_galaxy()
+
+
+def _run_region(task: _RegionTask) -> List[Tuple[int, Any]]:
+    """
+    Apply a function to every galaxy in one region; the unit of parallel work.
+
+    Runs in a worker process. It rebuilds its own halo catalogue and opens its own file
+    handles, so nothing is shared with the parent or with sibling workers and no
+    locking is required.
+
+    Parameters
+    ----------
+    task : :class:`~swiftgalaxy.iterator._RegionTask`
+        The region, its targets, and the function to apply.
+
+    Returns
+    -------
+    :obj:`list`
+        ``(target_index, result)`` pairs, so that the parent can restore the user's
+        ordering without relying on the order work completed in.
+    """
+    assert task.func is not None
+    args = task.args if task.args is not None else [tuple()] * len(task.target_indices)
+    kwargs = (
+        task.kwargs if task.kwargs is not None else [dict()] * len(task.target_indices)
+    )
+    results = []
+    for position, (target_index, swift_galaxy) in enumerate(_iterate_region(task)):
+        results.append(
+            (target_index, task.func(swift_galaxy, *args[position], **kwargs[position]))
+        )
+    return results
 
 
 class _IterationSolution(TypedDict):
@@ -450,33 +754,75 @@ class SWIFTGalaxies(object):
             cost=int(np.ceil(0.5 * (cost_min + cost_max))),  # estimate as the average
         )
 
-    def _start_server(self, region_mask: SWIFTMask) -> None:
+    @property
+    def _sg_kwargs(self) -> Dict[str, Any]:
         """
-        Create a "server" :class:`~swiftgalaxy.reader.SWIFTGalaxy`.
+        Configuration forwarded to every :class:`~swiftgalaxy.reader.SWIFTGalaxy`.
 
-        The "server" loads all of the particles in a given region and can be repeatedly
-        masked (creating copies of subsets of the particles) to efficiently provide
-        :class:`~swiftgalaxy.reader.SWIFTGalaxy`'s for all objects of interest in a common
-        region.
-
-        Parameters
-        ----------
-        region_mask : :class:`~swiftsimio.masks.SWIFTMask`
-            The spatial mask object for the server.
+        Returns
+        -------
+        :obj:`dict`
+            The dataset naming and transformation settings.
         """
-        self._server = SWIFTGalaxy._copyinit(
-            snapshot_filename=self.snapshot_filename,
-            halo_catalogue=None,
-            auto_recentre=False,
+        return dict(
             transforms_like_coordinates=self.transforms_like_coordinates,
             transforms_like_velocities=self.transforms_like_velocities,
             id_particle_dataset_name=self.id_particle_dataset_name,
             coordinates_dataset_name=self.coordinates_dataset_name,
             velocities_dataset_name=self.velocities_dataset_name,
-            _spatial_mask=region_mask,
-            _extra_mask=None,
         )
-        return
+
+    def _region_tasks(
+        self,
+        func: Optional[Callable] = None,
+        args: Optional[List[Tuple]] = None,
+        kwargs: Optional[List[Dict]] = None,
+    ) -> List[_RegionTask]:
+        """
+        Express the iteration solution as a list of picklable units of work.
+
+        Parameters
+        ----------
+        func : callable (optional), default: ``None``
+            Function to apply to each galaxy.
+
+        args : :obj:`list` (optional), default: ``None``
+            Positional arguments for ``func``, one :obj:`tuple` per target.
+
+        kwargs : :obj:`list` (optional), default: ``None``
+            Keyword arguments for ``func``, one :obj:`dict` per target.
+
+        Returns
+        -------
+        :obj:`list`
+            One :class:`~swiftgalaxy.iterator._RegionTask` per region.
+        """
+        frame_spec = (
+            _CoordinateFrameSpec.from_swift_galaxy(self.coordinate_frame_from)
+            if self.coordinate_frame_from is not None
+            else None
+        )
+        sg_kwargs = self._sg_kwargs
+        tasks = []
+        for region, target_indices in zip(
+            self._solution["regions"], self._solution["region_target_indices"]
+        ):
+            indices = [int(i) for i in target_indices]
+            tasks.append(
+                _RegionTask(
+                    snapshot_filename=self.snapshot_filename,
+                    catalogue_spec=self.halo_catalogue._subset_spec(indices),
+                    region=region,
+                    target_indices=indices,
+                    sg_kwargs=sg_kwargs,
+                    auto_recentre=self.auto_recentre,
+                    coordinate_frame_spec=frame_spec,
+                    func=func,
+                    args=[args[i] for i in indices] if args is not None else None,
+                    kwargs=[kwargs[i] for i in indices] if kwargs is not None else None,
+                )
+            )
+        return tasks
 
     def __iter__(self) -> Generator:
         """
@@ -503,55 +849,18 @@ class SWIFTGalaxies(object):
         iteration_order
         map
         """
-        for region, target_indices in zip(
-            self._solution["regions"], self._solution["region_target_indices"]
-        ):
-            region_mask = mask(self.snapshot_filename)
-            region_mask.constrain_spatial(region)
-            self._start_server(region_mask)
-            for igalaxy in target_indices:
-                self.halo_catalogue._mask_multi_galaxy(igalaxy)
-                server_mask = self.halo_catalogue._get_extra_mask(
-                    self._server, mask_loaded=False
-                )
-                swift_galaxy = self._server._data_copy(
-                    server_mask, _data_server=self._server
-                )
-                swift_galaxy.halo_catalogue = self.halo_catalogue
-                if self.auto_recentre and self.coordinate_frame_from is not None:
-                    raise ValueError(
-                        "Cannot use coordinate_frame_from with auto_recentre=True."
-                    )
-                elif self.coordinate_frame_from is not None:
-                    if (
-                        self.coordinate_frame_from.metadata.units.length
-                        != swift_galaxy.metadata.units.length
-                    ) or (
-                        self.coordinate_frame_from.metadata.units.time
-                        != swift_galaxy.metadata.units.time
-                    ):
-                        raise ValueError(
-                            "Internal units (length and time) of coordinate_frame_from"
-                            " don't match."
-                        )
-                    swift_galaxy._transform(
-                        self.coordinate_frame_from._coordinate_like_transform,
-                        boost=False,
-                    )
-                    swift_galaxy._transform(
-                        self.coordinate_frame_from._velocity_like_transform, boost=True
-                    )
-                elif self.auto_recentre:
-                    swift_galaxy.recentre(self.halo_catalogue.centre)
-                    swift_galaxy.recentre_velocity(self.halo_catalogue.velocity_centre)
+        for task in self._region_tasks():
+            for _, swift_galaxy in _iterate_region(
+                task, halo_catalogue=self.halo_catalogue
+            ):
                 yield swift_galaxy
-                self.halo_catalogue._unmask_multi_galaxy()
 
     def map(
         self,
         func: Callable,
         args: Optional[List[Tuple]] = None,
         kwargs: Optional[List[Dict]] = None,
+        nproc: int = 1,
     ) -> List[Any]:
         """
         Apply a function to each object of interest and return a list of results.
@@ -570,8 +879,10 @@ class SWIFTGalaxies(object):
         objects) that can be passed to map as a :obj:`tuple` of arguments and a
         :obj:`dict` of keyword arguments.
 
-        Currently this function only executes serially but adding a parallel execution
-        option, and further support for parallelization in analysis, is a high priority.
+        Set ``nproc`` greater than 1 to evaluate the function in parallel, with one
+        worker process per region. Because each worker opens its own files and rebuilds
+        its own halo catalogue, nothing is shared between workers. With ``nproc=1``
+        (the default) execution is serial and unchanged.
 
         Parameters
         ----------
@@ -590,12 +901,25 @@ class SWIFTGalaxies(object):
             the names of the keyword arguments and the corresponding dictionary values are
             the values of the keyword arguments. See examples section for further details.
 
+        nproc : :obj:`int` (optional), default: ``1``
+            Number of worker processes to use, one region at a time each. The default of
+            ``1`` evaluates serially in the current process. Values greater than ``1``
+            require that ``func`` is defined at module level (so that it can be pickled)
+            and that its return values are picklable and small: returning particle-sized
+            arrays from many regions can cost more in inter-process communication than
+            the parallelism saves.
+
         Returns
         -------
         :obj:`list`
             A list containing the return value(s) of the function applied to each object
             of interest, in the same order as the objects of interest were passed to the
             halo finder interface.
+
+        Raises
+        ------
+        ValueError
+            If ``nproc`` is less than ``1``.
 
         Examples
         --------
@@ -682,13 +1006,31 @@ class SWIFTGalaxies(object):
 
         The commas inside the parentheses are not optional!
         """
-        result = [None] * len(self.iteration_order)  # empty list for results
+        if nproc < 1:
+            raise ValueError("nproc must be at least 1.")
+        ntargets = len(self.iteration_order)
+        result: List[Any] = [None] * ntargets
         if args is None:
-            args = [tuple()] * len(self.iteration_order)
+            args = [tuple()] * ntargets
         if kwargs is None:
-            kwargs = [dict()] * len(self.iteration_order)
-        for sg, iteration_location in zip(self, self.iteration_order):
-            result[sg.halo_catalogue._multi_galaxy_catalogue_mask] = func(
-                sg, *args[iteration_location], **kwargs[iteration_location]
-            )
+            kwargs = [dict()] * ntargets
+        tasks = self._region_tasks(func=func, args=args, kwargs=kwargs)
+        if nproc == 1:
+            for task in tasks:
+                for target_index, swift_galaxy in _iterate_region(
+                    task, halo_catalogue=self.halo_catalogue
+                ):
+                    result[target_index] = func(
+                        swift_galaxy, *args[target_index], **kwargs[target_index]
+                    )
+            return result
+        # Largest regions first: finishing on a straggler wastes the most time, and
+        # region costs vary a great deal in practice.
+        tasks.sort(key=lambda task: len(task.target_indices), reverse=True)
+        with ProcessPoolExecutor(
+            max_workers=nproc, mp_context=_worker_context()
+        ) as executor:
+            for region_results in executor.map(_run_region, tasks):
+                for target_index, value in region_results:
+                    result[target_index] = value
         return result

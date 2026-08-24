@@ -737,3 +737,110 @@ class TestSWIFTGalaxies:
             != server.gas._internal_dataset._masses.shape
         )
         assert np.all(client2.gas._internal_dataset._masses == 0)
+
+
+def _n_dm(sg):
+    """
+    Count dark matter particles.
+
+    Defined at module level so that it can be pickled and sent to worker processes.
+
+    Parameters
+    ----------
+    sg : :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+        The galaxy to count particles for.
+
+    Returns
+    -------
+    :obj:`int`
+        Number of dark matter particles.
+    """
+    return int(sg.dark_matter.coordinates.shape[0])
+
+
+def _scaled_n_dm(sg, factor, offset=0.0):
+    """
+    Count dark matter particles, with extra arguments, to check argument routing.
+
+    Parameters
+    ----------
+    sg : :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+        The galaxy to count particles for.
+
+    factor : :obj:`float`
+        Multiplied into the result.
+
+    offset : :obj:`float` (optional), default: ``0.0``
+        Added to the result.
+
+    Returns
+    -------
+    :obj:`float`
+        The scaled particle count.
+    """
+    return _n_dm(sg) * factor + offset
+
+
+def _sgs_for(hf_multi, tmp_path_factory):
+    """
+    Build a :class:`~swiftgalaxy.iterator.SWIFTGalaxies` for a multi-target catalogue.
+
+    Follows the same file layout logic as the other tests in this module.
+
+    Parameters
+    ----------
+    hf_multi : :class:`~swiftgalaxy.halo_catalogues._HaloCatalogue`
+        A halo catalogue containing several targets.
+
+    tmp_path_factory : :class:`pytest.TempPathFactory`
+        Factory for temporary directories.
+
+    Returns
+    -------
+    :class:`~swiftgalaxy.iterator.SWIFTGalaxies`
+        Iterator over the catalogue's targets.
+    """
+    if isinstance(hf_multi, SOAP):
+        tp = hf_multi.soap_file.parent
+    elif isinstance(hf_multi, Caesar):
+        tp = hf_multi.caesar_file.parent
+    elif isinstance(hf_multi, Velociraptor):
+        tp = Path(hf_multi.velociraptor_files["properties"]).parent
+    else:
+        tp = tmp_path_factory.mktemp(_toysnap_filename.parent)
+        _create_toysnap(snapfile=tp / _toysnap_filename.name)
+    return SWIFTGalaxies(
+        (
+            tp / _toysoap_virtual_snapshot_filename.name
+            if isinstance(hf_multi, SOAP)
+            else tp / _toysnap_filename.name
+        ),
+        hf_multi,
+    )
+
+
+class TestParallelMap:
+    """Check that evaluating map in parallel agrees with evaluating it serially."""
+
+    def test_parallel_matches_serial(self, tmp_path_factory, hf_multi):
+        """Check that parallel results equal serial results, in the input order."""
+        sgs = _sgs_for(hf_multi, tmp_path_factory)
+        serial = sgs.map(_n_dm)
+        for nproc in (2, 3):
+            assert sgs.map(_n_dm, nproc=nproc) == serial
+
+    def test_parallel_args_and_kwargs(self, tmp_path_factory, hf_multi):
+        """Check that args and kwargs reach the galaxy that they belong to."""
+        sgs = _sgs_for(hf_multi, tmp_path_factory)
+        ntargets = len(sgs.iteration_order)
+        args = [(i + 1,) for i in range(ntargets)]
+        kwargs = [dict(offset=10.0 * i) for i in range(ntargets)]
+        assert sgs.map(_scaled_n_dm, args=args, kwargs=kwargs, nproc=2) == sgs.map(
+            _scaled_n_dm, args=args, kwargs=kwargs
+        )
+
+    def test_invalid_nproc(self, tmp_path_factory, hf_multi):
+        """Check that a nonsensical number of processes is rejected."""
+        sgs = _sgs_for(hf_multi, tmp_path_factory)
+        with pytest.raises(ValueError, match="nproc"):
+            sgs.map(_n_dm, nproc=0)
