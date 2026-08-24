@@ -809,9 +809,14 @@ def _assorted_types(sg):
     }
 
 
-def _mean_x(sg):
+def _sum_x(sg):
     """
-    Mean dark matter x coordinate, sensitive to the coordinate frame.
+    Sum of x coordinates over all present particle types.
+
+    Sensitive to the coordinate frame, but unlike a mean it stays finite when a
+    particle type is empty. Caesar galaxies, for instance, contain no dark matter at
+    all, and a mean over those would be NaN in both the serial and parallel results,
+    which compare unequal and would mask a real disagreement.
 
     Parameters
     ----------
@@ -821,10 +826,16 @@ def _mean_x(sg):
     Returns
     -------
     :obj:`float`
-        The mean x coordinate, in the galaxy's length units.
+        Summed x coordinate, in the galaxy's length units.
     """
-    xyz = sg.dark_matter.coordinates
-    return float(np.mean(xyz.to_value(xyz.units)[:, 0]))
+    total = 0.0
+    for particle_type in ("dark_matter", "stars", "gas"):
+        if not hasattr(sg, particle_type):
+            continue
+        xyz = getattr(sg, particle_type).coordinates
+        if xyz.shape[0]:
+            total += float(np.sum(xyz.to_value(xyz.units)[:, 0]))
+    return total
 
 
 def _always_raises(sg):
@@ -1123,16 +1134,16 @@ class TestParallelMapCoordinateFrame:
         sgs = _sgs_for(
             hf_multi, tmp_path_factory, auto_recentre=False, coordinate_frame_from=ref
         )
-        assert np.allclose(sgs.map(_mean_x, nproc=2), sgs.map(_mean_x))
+        assert np.allclose(sgs.map(_sum_x, nproc=2), sgs.map(_sum_x))
 
     def test_coordinate_frame_actually_applied(self, tmp_path_factory, hf_multi):
         """Check that copying a frame changes the answer, so the test above has teeth."""
         ref = self._reference_galaxy(hf_multi, tmp_path_factory)
         framed = _sgs_for(
             hf_multi, tmp_path_factory, auto_recentre=False, coordinate_frame_from=ref
-        ).map(_mean_x, nproc=2)
+        ).map(_sum_x, nproc=2)
         unframed = _sgs_for(hf_multi, tmp_path_factory, auto_recentre=False).map(
-            _mean_x, nproc=2
+            _sum_x, nproc=2
         )
         assert not np.allclose(framed, unframed)
 
@@ -1144,7 +1155,7 @@ class TestParallelMapCoordinateFrame:
             hf_multi, tmp_path_factory, auto_recentre=True, coordinate_frame_from=ref
         )
         with pytest.raises(ValueError, match="coordinate_frame_from"):
-            sgs.map(_mean_x, nproc=nproc)
+            sgs.map(_sum_x, nproc=nproc)
 
 
 class TestCoordinateFrameSpec:
@@ -1230,3 +1241,185 @@ class TestWorkerStartMethod:
             assert context.get_start_method() == "forkserver"
         else:
             assert context.get_start_method() in ("spawn", "forkserver")
+
+
+def _own_index(sg):
+    """
+    Report the catalogue's own identifier for the galaxy being processed.
+
+    Confirms that a worker rebuilt its catalogue around the target it was actually
+    given, rather than silently processing a different one.
+
+    Parameters
+    ----------
+    sg : :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+        The galaxy being processed.
+
+    Returns
+    -------
+    :obj:`int`
+        The catalogue index of this galaxy.
+    """
+    catalogue = sg.halo_catalogue
+    return int(np.atleast_1d(getattr(catalogue, catalogue._index_attr[1:]))[0])
+
+
+def _own_centre_x(sg):
+    """
+    Report the x coordinate of the centre the worker's catalogue was built around.
+
+    :class:`~swiftgalaxy.halo_catalogues.Standalone` has no catalogue index, and a
+    worker's rebuilt catalogue holds only its own target, so identity is checked by
+    centre rather than by position in a list.
+
+    Parameters
+    ----------
+    sg : :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+        The galaxy being processed.
+
+    Returns
+    -------
+    :obj:`float`
+        The x coordinate of this galaxy's centre.
+    """
+    centre = np.atleast_2d(sg.halo_catalogue.centre)
+    return float(centre[0, 0].to_value(centre.units))
+
+
+def _catalogue_class_name(sg):
+    """
+    Report the class of the halo catalogue seen inside the worker.
+
+    Parameters
+    ----------
+    sg : :class:`~swiftgalaxy.reader.SWIFTGalaxy`
+        The galaxy being processed.
+
+    Returns
+    -------
+    :obj:`str`
+        Name of the halo catalogue class.
+    """
+    return type(sg.halo_catalogue).__name__
+
+
+class TestParallelMapSOAP:
+    """Parallel iteration specifics for the SOAP backend."""
+
+    def test_targets_not_mixed_up(self, sgs_soap):
+        """Check that each worker processes the SOAP target it was given."""
+        assert sgs_soap.map(_own_index, nproc=2) == [0, 1]
+
+    def test_catalogue_available_in_worker(self, sgs_soap):
+        """Check that the rebuilt catalogue is a SOAP catalogue in the worker."""
+        assert sgs_soap.map(_catalogue_class_name, nproc=2) == ["SOAP", "SOAP"]
+
+    def test_results_match_serial(self, sgs_soap):
+        """Check that parallel and serial agree for SOAP."""
+        assert sgs_soap.map(_n_dm, nproc=2) == sgs_soap.map(_n_dm)
+
+    def test_centre_types_survive_reconstruction(self, soap_multi):
+        """Check that SOAP's two centre-type options are carried to the worker."""
+        soap_class, kwargs = soap_multi._subset_spec([0])
+        assert kwargs["centre_type"] == soap_multi.centre_type
+        assert kwargs["velocity_centre_type"] == soap_multi.velocity_centre_type
+        assert Path(kwargs["soap_file"]) == Path(soap_multi.soap_file)
+        assert soap_class is SOAP
+
+
+class TestParallelMapVelociraptor:
+    """Parallel iteration specifics for the Velociraptor backend."""
+
+    def test_targets_not_mixed_up(self, sgs_vr):
+        """Check that each worker processes the Velociraptor target it was given."""
+        assert sgs_vr.map(_own_index, nproc=2) == [0, 1]
+
+    def test_catalogue_available_in_worker(self, sgs_vr):
+        """Check that the rebuilt catalogue is a Velociraptor catalogue."""
+        assert sgs_vr.map(_catalogue_class_name, nproc=2) == [
+            "Velociraptor",
+            "Velociraptor",
+        ]
+
+    def test_results_match_serial(self, sgs_vr):
+        """Check that parallel and serial agree for Velociraptor."""
+        assert sgs_vr.map(_n_dm, nproc=2) == sgs_vr.map(_n_dm)
+
+    def test_both_catalogue_files_survive_reconstruction(self, vr_multi):
+        """Check that both of Velociraptor's file paths reach the worker.
+
+        Velociraptor is the only backend built from a pair of files, and it can be
+        constructed from a filebase instead, so the rebuilt catalogue has to carry the
+        resolved pair rather than the filebase it was given.
+        """
+        vr_class, kwargs = vr_multi._subset_spec([0])
+        assert set(kwargs["velociraptor_files"]) == {"properties", "catalog_groups"}
+        assert kwargs["velociraptor_files"] == vr_multi.velociraptor_files
+        assert isinstance(vr_class(**kwargs), Velociraptor)
+
+
+class TestParallelMapCaesar:
+    """Parallel iteration specifics for the Caesar backend."""
+
+    def test_targets_not_mixed_up(self, sgs_caesar):
+        """Check that each worker processes the Caesar target it was given."""
+        assert sgs_caesar.map(_own_index, nproc=2) == [0, 1]
+
+    def test_catalogue_available_in_worker(self, sgs_caesar):
+        """Check that the rebuilt catalogue is a Caesar catalogue."""
+        assert sgs_caesar.map(_catalogue_class_name, nproc=2) == ["Caesar", "Caesar"]
+
+    def test_results_match_serial(self, sgs_caesar):
+        """Check that parallel and serial agree for both Caesar group types."""
+        assert sgs_caesar.map(_n_dm, nproc=2) == sgs_caesar.map(_n_dm)
+
+    def test_group_type_reaches_the_worker(self, sgs_caesar):
+        """Check that halo/galaxy selection actually changes what a worker sees.
+
+        Caesar galaxies contain no dark matter while haloes do, so the particle counts
+        distinguish the two. If ``group_type`` were lost when the catalogue was rebuilt,
+        workers would quietly analyse the wrong kind of object and this would catch it.
+        """
+        counts = sgs_caesar.map(_n_dm, nproc=2)
+        if sgs_caesar.halo_catalogue.group_type == "galaxy":
+            assert set(counts) == {0}
+        else:
+            assert max(counts) > 0
+
+    def test_group_type_survives_reconstruction(self, caesar_multi):
+        """Check that the group type is present in the reconstruction spec."""
+        caesar_class, kwargs = caesar_multi._subset_spec([0])
+        assert kwargs["group_type"] == caesar_multi.group_type
+        assert caesar_class(**kwargs).group_type == caesar_multi.group_type
+
+
+class TestParallelMapStandalone:
+    """Parallel iteration specifics for the Standalone backend."""
+
+    def test_targets_not_mixed_up(self, sgs_sa):
+        """Check that each worker processes the centre it was given, in input order."""
+        centres = np.atleast_2d(sgs_sa.halo_catalogue._centre)
+        expected = [float(c.to_value(centres.units)) for c in centres[:, 0]]
+        assert np.allclose(sgs_sa.map(_own_centre_x, nproc=2), expected)
+
+    def test_results_match_serial(self, sgs_sa):
+        """Check that parallel and serial agree for Standalone."""
+        assert sgs_sa.map(_n_dm, nproc=2) == sgs_sa.map(_n_dm)
+
+    def test_centres_passed_by_value(self, sa_multi):
+        """Check that centres are sliced and sent, there being no file to reopen."""
+        _, kwargs = sa_multi._subset_spec([1])
+        assert "centre" in kwargs and "velocity_centre" in kwargs
+        assert np.allclose(
+            np.atleast_2d(kwargs["centre"])[0], np.atleast_2d(sa_multi._centre)[1]
+        )
+        assert np.allclose(
+            np.atleast_2d(kwargs["velocity_centre"])[0],
+            np.atleast_2d(sa_multi._velocity_centre)[1],
+        )
+
+    def test_centres_keep_their_units(self, sa_multi):
+        """Check that the sliced centres remain cosmo_arrays with units."""
+        _, kwargs = sa_multi._subset_spec([0])
+        assert isinstance(kwargs["centre"], cosmo_array)
+        assert kwargs["centre"].units == np.atleast_2d(sa_multi._centre).units
