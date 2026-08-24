@@ -5,7 +5,8 @@ Provides the :class:`~swiftgalaxy.iterator.SWIFTGalaxies` class that enables eff
 iteration over :class:`~swiftgalaxy.reader.SWIFTGalaxy` objects for multiple objects of
 interest within a single simulation snapshot.
 
-Parallelization is not yet implemented but is prioritized for future release.
+Iteration can be spread across worker processes with the ``nproc`` argument of
+:func:`~swiftgalaxy.iterator.SWIFTGalaxies.map`, one region at a time per worker.
 """
 
 import multiprocessing
@@ -363,12 +364,14 @@ class SWIFTGalaxies(object):
     function applied to a list of target objects in the same order as the input list can
     be obtained using the :meth:`~swiftgalaxy.iterator.SWIFTGalaxies.map` method.
 
-    There is an obvious opportunity to parallelize the iteration process by passing each
-    region (potentially each containing multiple target objects) to worker processes as
-    they become available, for example. This current initial version of the
-    :class:`~swiftgalaxy.iterator.SWIFTGalaxies` class does not yet support parallel
-    iteration, instead prioritizing the release of a working serial implementation.
-    Support for parallelization will be added later as a high priority.
+    The iteration can be parallelized by passing ``nproc`` to
+    :meth:`~swiftgalaxy.iterator.SWIFTGalaxies.map`, which hands each region (potentially
+    containing several target objects) to a worker process as one becomes free. Each
+    worker reads its region and iterates that region's galaxies within the worker, so
+    that a set of top-level cells is still read only once. Iterating a
+    :class:`~swiftgalaxy.iterator.SWIFTGalaxies` directly is always serial: the
+    :class:`~swiftgalaxy.reader.SWIFTGalaxy` objects that it yields hold open file
+    handles and cannot be transferred between processes.
 
     Parameters
     ----------
