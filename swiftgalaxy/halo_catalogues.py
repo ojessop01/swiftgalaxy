@@ -746,6 +746,36 @@ class SOAP(_HaloCatalogue):
         squeezed_index = np.squeeze(index)
         return int(squeezed_index) if squeezed_index.ndim == 0 else list(squeezed_index)
 
+    def _subset_spec(self, target_indices: Sequence[int]) -> tuple:
+        """
+        Describe this catalogue, restricted to some targets, as picklable plain data.
+
+        :mod:`swiftsimio`'s masking reads SOAP catalogue rows in sorted order rather
+        than in the order the ``soap_index`` list was given, and the rest of
+        :class:`~swiftgalaxy.halo_catalogues.SOAP` follows that convention: a target's
+        position refers to the sorted list, not to the list the user supplied. Selecting
+        a subset therefore has to sort before indexing, or a reordered ``soap_index``
+        would rebuild the catalogue around the wrong haloes.
+
+        Parameters
+        ----------
+        target_indices : :obj:`~collections.abc.Sequence`
+            Positions (into the sorted target list) of the targets to keep.
+
+        Returns
+        -------
+        :obj:`tuple`
+            A ``(class, kwargs)`` pair; ``class(**kwargs)`` rebuilds the catalogue.
+
+        See Also
+        --------
+        swiftgalaxy.halo_catalogues.SOAP._mask_multi_galaxy
+        """
+        cls, kwargs = super()._subset_spec(target_indices)
+        ordered = np.sort(np.atleast_1d(np.asarray(self._soap_index)))
+        kwargs["soap_index"] = [int(ordered[i]) for i in target_indices]
+        return cls, kwargs
+
     def _mask_multi_galaxy(self, index: int) -> None:
         """
         Switch on restricting the catalogue to a single row.

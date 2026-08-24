@@ -136,8 +136,15 @@ class _RegionTask(NamedTuple):
         Bounding box of the region to read.
 
     target_indices : :obj:`list`
-        Positions of this region's targets in the user's original target list, used to
-        key the results.
+        Positions of this region's targets in the user's original target list.
+
+    result_slots : :obj:`list`
+        Where each target's result belongs in the output list. Evaluated by the parent
+        because it is the halo catalogue that decides: :class:`SOAP` in particular
+        overrides
+        :meth:`~swiftgalaxy.halo_catalogues._HaloCatalogue._mask_multi_galaxy` to correct
+        for :mod:`swiftsimio` reading catalogue rows in sorted order, so a target's
+        position in the input list is not necessarily its slot in the results.
 
     sg_kwargs : :obj:`dict`
         Configuration forwarded to each
@@ -165,6 +172,7 @@ class _RegionTask(NamedTuple):
     catalogue_spec: Tuple
     region: cosmo_array
     target_indices: List[int]
+    result_slots: List[int]
     sg_kwargs: Dict[str, Any]
     auto_recentre: bool
     coordinate_frame_spec: Optional[_CoordinateFrameSpec] = None
@@ -257,8 +265,8 @@ def _iterate_region(
     Yields
     ------
     :obj:`tuple`
-        Pairs of the target's position in the user's original list and the
-        corresponding :class:`~swiftgalaxy.reader.SWIFTGalaxy`.
+        Pairs of the target's position within this task and the corresponding
+        :class:`~swiftgalaxy.reader.SWIFTGalaxy`.
 
     Raises
     ------
@@ -273,7 +281,7 @@ def _iterate_region(
     else:
         local_indices = list(task.target_indices)
     server = _make_server(task.snapshot_filename, task.region, task.sg_kwargs)
-    for local_index, target_index in zip(local_indices, task.target_indices):
+    for position, local_index in enumerate(local_indices):
         halo_catalogue._mask_multi_galaxy(local_index)
         server_mask = halo_catalogue._get_extra_mask(server, mask_loaded=False)
         swift_galaxy = server._data_copy(server_mask, _data_server=server)
@@ -287,7 +295,7 @@ def _iterate_region(
         elif task.auto_recentre:
             swift_galaxy.recentre(halo_catalogue.centre)
             swift_galaxy.recentre_velocity(halo_catalogue.velocity_centre)
-        yield target_index, swift_galaxy
+        yield position, swift_galaxy
         halo_catalogue._unmask_multi_galaxy()
 
 
@@ -307,7 +315,7 @@ def _run_region(task: _RegionTask) -> List[Tuple[int, Any]]:
     Returns
     -------
     :obj:`list`
-        ``(target_index, result)`` pairs, so that the parent can restore the user's
+        ``(result_slot, result)`` pairs, so that the parent can restore the user's
         ordering without relying on the order work completed in.
     """
     assert task.func is not None
@@ -316,9 +324,12 @@ def _run_region(task: _RegionTask) -> List[Tuple[int, Any]]:
         task.kwargs if task.kwargs is not None else [dict()] * len(task.target_indices)
     )
     results = []
-    for position, (target_index, swift_galaxy) in enumerate(_iterate_region(task)):
+    for position, swift_galaxy in _iterate_region(task):
         results.append(
-            (target_index, task.func(swift_galaxy, *args[position], **kwargs[position]))
+            (
+                task.result_slots[position],
+                task.func(swift_galaxy, *args[position], **kwargs[position]),
+            )
         )
     return results
 
@@ -808,12 +819,24 @@ class SWIFTGalaxies(object):
             self._solution["regions"], self._solution["region_target_indices"]
         ):
             indices = [int(i) for i in target_indices]
+            # Ask the catalogue where each result belongs. SOAP corrects for
+            # swiftsimio reading rows in sorted order, so this is not always the
+            # target's position in the input list.
+            result_slots = []
+            for index in indices:
+                self.halo_catalogue._mask_multi_galaxy(index)
+                slot = self.halo_catalogue._multi_galaxy_catalogue_mask
+                # masking always sets this; the Optional is for the unmasked state
+                assert slot is not None
+                result_slots.append(int(slot))
+                self.halo_catalogue._unmask_multi_galaxy()
             tasks.append(
                 _RegionTask(
                     snapshot_filename=self.snapshot_filename,
                     catalogue_spec=self.halo_catalogue._subset_spec(indices),
                     region=region,
                     target_indices=indices,
+                    result_slots=result_slots,
                     sg_kwargs=sg_kwargs,
                     auto_recentre=self.auto_recentre,
                     coordinate_frame_spec=frame_spec,
@@ -1017,10 +1040,11 @@ class SWIFTGalaxies(object):
         tasks = self._region_tasks(func=func, args=args, kwargs=kwargs)
         if nproc == 1:
             for task in tasks:
-                for target_index, swift_galaxy in _iterate_region(
+                for position, swift_galaxy in _iterate_region(
                     task, halo_catalogue=self.halo_catalogue
                 ):
-                    result[target_index] = func(
+                    target_index = task.target_indices[position]
+                    result[task.result_slots[position]] = func(
                         swift_galaxy, *args[target_index], **kwargs[target_index]
                     )
             return result
@@ -1031,6 +1055,6 @@ class SWIFTGalaxies(object):
             max_workers=nproc, mp_context=_worker_context()
         ) as executor:
             for region_results in executor.map(_run_region, tasks):
-                for target_index, value in region_results:
-                    result[target_index] = value
+                for result_slot, value in region_results:
+                    result[result_slot] = value
         return result
